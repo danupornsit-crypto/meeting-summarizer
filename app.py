@@ -1,5 +1,6 @@
 import streamlit as st
-import google.generativeai as genai
+from google import genai
+from google.genai import types
 from groq import Groq
 import tempfile
 import os
@@ -108,10 +109,9 @@ if st.button("🚀 เริ่มสรุปประชุม"):
 
         with st.status("✨ กำลังสรุป (Gemini)...", expanded=True) as status:
             try:
-                genai.configure(api_key=st.session_state["gemini_api_key"])
-                gemini = genai.GenerativeModel("gemini-1.5-flash")
+                client = genai.Client(api_key=st.session_state["gemini_api_key"])
                 prompt = PROMPTS[summary_style] + f"\n\n---\nข้อความจากการประชุม:\n{transcript}"
-                response = gemini.generate_content(prompt)
+                response = client.models.generate_content(model="gemini-2.0-flash", contents=prompt)
                 summary = response.text
                 status.update(label="✅ สรุปสำเร็จ", state="complete")
             except Exception as e:
