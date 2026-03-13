@@ -3,8 +3,8 @@ from groq import Groq
 from google import genai
 import tempfile
 import os
+import subprocess
 from pathlib import Path
-from pydub import AudioSegment
 
 groq_default = os.environ.get("GROQ_API_KEY", "")
 gemini_default = os.environ.get("GEMINI_API_KEY", "")
@@ -78,31 +78,49 @@ PROMPTS = {
     "Minutes of Meeting (MOM)": """เขียน Minutes of Meeting (MOM) ภาษาไทยจากการประชุมต่อไปนี้ ประกอบด้วย:\n- วัตถุประสงค์การประชุม\n- ผู้เข้าร่วม (ถ้ามีการกล่าวถึง)\n- สรุปการหารือแต่ละหัวข้อ\n- มติที่ประชุม\n- Action Items และผู้รับผิดชอบ""",
 }
 
-CHUNK_MINUTES = 15
+CHUNK_SECONDS = 15 * 60  # 15 นาที
+
+def get_duration(file_path):
+    """ดึงความยาวไฟล์เสียงด้วย ffprobe"""
+    result = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+         "-of", "default=noprint_wrappers=1:nokey=1", file_path],
+        capture_output=True, text=True
+    )
+    return float(result.stdout.strip())
 
 def split_and_transcribe(client, file_path, language, status_container):
-    audio = AudioSegment.from_file(file_path)
-    duration_ms = len(audio)
-    chunk_ms = CHUNK_MINUTES * 60 * 1000
-    num_chunks = max(1, -(-duration_ms // chunk_ms))
+    """ตัดไฟล์ด้วย ffmpeg แล้วถอดเสียงทีละช่วง"""
+    duration = get_duration(file_path)
+    num_chunks = max(1, int(duration // CHUNK_SECONDS) + (1 if duration % CHUNK_SECONDS > 0 else 0))
 
     if num_chunks == 1:
         status_container.write("🎙️ กำลังถอดเสียง...")
-    else:
-        status_container.write(f"📦 ไฟล์ยาว {duration_ms//60000} นาที กำลังแบ่งเป็น {num_chunks} ช่วง...")
+        with open(file_path, "rb") as f:
+            result = client.audio.transcriptions.create(
+                file=(Path(file_path).name, f.read()),
+                model="whisper-large-v3-turbo",
+                language=language,
+                response_format="text",
+            )
+        return result
+
+    status_container.write(f"📦 ไฟล์ยาว {int(duration//60)} นาที กำลังแบ่งเป็น {num_chunks} ช่วง...")
 
     transcripts = []
     for i in range(num_chunks):
-        start_ms = i * chunk_ms
-        end_ms = min(start_ms + chunk_ms, duration_ms)
-        chunk = audio[start_ms:end_ms]
-
-        if num_chunks > 1:
-            status_container.write(f"🎙️ ถอดเสียงช่วงที่ {i+1}/{num_chunks} ({start_ms//60000}-{end_ms//60000} นาที)...")
+        start = i * CHUNK_SECONDS
+        status_container.write(f"🎙️ ถอดเสียงช่วงที่ {i+1}/{num_chunks} ({start//60}-{min(int(duration), start+CHUNK_SECONDS)//60} นาที)...")
 
         with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as chunk_file:
-            chunk.export(chunk_file.name, format="mp3")
             chunk_path = chunk_file.name
+
+        subprocess.run([
+            "ffmpeg", "-y", "-i", file_path,
+            "-ss", str(start), "-t", str(CHUNK_SECONDS),
+            "-acodec", "libmp3lame", "-q:a", "4",
+            chunk_path
+        ], capture_output=True)
 
         try:
             with open(chunk_path, "rb") as f:
