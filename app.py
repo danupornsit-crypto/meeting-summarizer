@@ -1,9 +1,9 @@
 import streamlit as st
-from google import genai
-from google.genai import types
 from groq import Groq
+from google import genai
 import tempfile
 import os
+import math
 from pathlib import Path
 
 groq_default = os.environ.get("GROQ_API_KEY", "")
@@ -58,7 +58,7 @@ st.markdown('<hr class="divider">', unsafe_allow_html=True)
 uploaded_file = st.file_uploader(
     "📁 อัปโหลดไฟล์เสียงประชุม",
     type=["mp3", "mp4", "m4a", "wav", "ogg", "webm"],
-    help="รองรับ mp3, mp4, m4a, wav, ogg, webm — ขนาดสูงสุด 25MB"
+    help="รองรับ mp3, mp4, m4a, wav, ogg, webm — ไม่จำกัดขนาด"
 )
 
 col1, col2 = st.columns([1, 2])
@@ -78,46 +78,97 @@ PROMPTS = {
     "Minutes of Meeting (MOM)": """เขียน Minutes of Meeting (MOM) ภาษาไทยจากการประชุมต่อไปนี้ ประกอบด้วย:\n- วัตถุประสงค์การประชุม\n- ผู้เข้าร่วม (ถ้ามีการกล่าวถึง)\n- สรุปการหารือแต่ละหัวข้อ\n- มติที่ประชุม\n- Action Items และผู้รับผิดชอบ""",
 }
 
+CHUNK_SIZE = 20 * 1024 * 1024  # 20MB per chunk
+
+def transcribe_file(client, file_path, filename, language):
+    """ถอดเสียงไฟล์ชิ้นเดียว"""
+    with open(file_path, "rb") as f:
+        result = client.audio.transcriptions.create(
+            file=(filename, f.read()),
+            model="whisper-large-v3-turbo",
+            language=language,
+            response_format="text",
+        )
+    return result
+
+def split_and_transcribe(client, file_path, filename, language, status_container):
+    """ตัดไฟล์ใหญ่เป็นช่วงๆ แล้วถอดเสียงทีละช่วง"""
+    file_size = os.path.getsize(file_path)
+    
+    if file_size <= CHUNK_SIZE:
+        # ไฟล์เล็กพอ ถอดเสียงได้เลย
+        return transcribe_file(client, file_path, filename, language)
+    
+    # ไฟล์ใหญ่เกิน ต้องตัดเป็นช่วงๆ
+    num_chunks = math.ceil(file_size / CHUNK_SIZE)
+    status_container.write(f"📦 ไฟล์ใหญ่ กำลังแบ่งเป็น {num_chunks} ช่วง...")
+    
+    with open(file_path, "rb") as f:
+        file_data = f.read()
+    
+    transcripts = []
+    suffix = Path(filename).suffix
+    
+    for i in range(num_chunks):
+        start = i * CHUNK_SIZE
+        end = min(start + CHUNK_SIZE, file_size)
+        chunk_data = file_data[start:end]
+        
+        status_container.write(f"🎙️ ถอดเสียงช่วงที่ {i+1}/{num_chunks}...")
+        
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as chunk_file:
+            chunk_file.write(chunk_data)
+            chunk_path = chunk_file.name
+        
+        try:
+            chunk_transcript = transcribe_file(client, chunk_path, f"chunk_{i}{suffix}", language)
+            transcripts.append(chunk_transcript)
+        finally:
+            if os.path.exists(chunk_path):
+                os.unlink(chunk_path)
+    
+    return " ".join(transcripts)
+
 if st.button("🚀 เริ่มสรุปประชุม"):
     if not uploaded_file:
         st.warning("⚠️ กรุณาอัปโหลดไฟล์เสียงก่อน")
     elif not st.session_state.get("groq_api_key") or not st.session_state.get("gemini_api_key"):
         st.warning("⚠️ กรุณาใส่ API Keys ทั้งสองตัวก่อน")
     else:
+        # Step 1: Transcribe
         with st.status("🎙️ กำลังถอดคำพูด (Groq Whisper)...", expanded=True) as status:
             with tempfile.NamedTemporaryFile(delete=False, suffix=Path(uploaded_file.name).suffix) as tmp:
                 tmp.write(uploaded_file.read())
                 tmp_path = tmp.name
             try:
-                client = Groq(api_key=st.session_state["groq_api_key"])
-                with open(tmp_path, "rb") as audio_file:
-                    transcription = client.audio.transcriptions.create(
-                        file=(uploaded_file.name, audio_file.read()),
-                        model="whisper-large-v3-turbo",
-                        language=language,
-                        response_format="text",
-                    )
-                transcript = transcription
+                groq_client = Groq(api_key=st.session_state["groq_api_key"])
+                transcript = split_and_transcribe(
+                    groq_client, tmp_path, uploaded_file.name, language, status
+                )
                 status.update(label="✅ ถอดคำพูดสำเร็จ", state="complete")
             except Exception as e:
                 st.error(f"❌ Groq Error: {e}")
-                os.unlink(tmp_path)
                 st.stop()
             finally:
                 if os.path.exists(tmp_path):
                     os.unlink(tmp_path)
 
+        # Step 2: Summarize
         with st.status("✨ กำลังสรุป (Gemini)...", expanded=True) as status:
             try:
-                client = genai.Client(api_key=st.session_state["gemini_api_key"])
+                gemini_client = genai.Client(api_key=st.session_state["gemini_api_key"])
                 prompt = PROMPTS[summary_style] + f"\n\n---\nข้อความจากการประชุม:\n{transcript}"
-                response = client.models.generate_content(model="gemini-2.0-flash", contents=prompt)
+                response = gemini_client.models.generate_content(
+                    model="gemini-2.0-flash",
+                    contents=prompt
+                )
                 summary = response.text
                 status.update(label="✅ สรุปสำเร็จ", state="complete")
             except Exception as e:
                 st.error(f"❌ Gemini Error: {e}")
                 st.stop()
 
+        # Results
         st.markdown('<div class="status-pill">✓ เสร็จสิ้น</div>', unsafe_allow_html=True)
         st.markdown("### 📋 สรุปการประชุม")
         st.markdown(f'<div class="result-box">{summary}</div>', unsafe_allow_html=True)
